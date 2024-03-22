@@ -362,6 +362,13 @@ def freeze_params(params):
 
 def main():
     args = parse_args()
+
+    if args.report_to == "wandb" and args.hub_token is not None:
+        raise ValueError(
+            "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
+            " Please use `huggingface-cli login` to authenticate with the Hub."
+        )
+
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
     accelerator = Accelerator(
@@ -481,8 +488,8 @@ def main():
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
+        num_training_steps=args.max_train_steps * accelerator.num_processes,
     )
 
     text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -601,7 +608,7 @@ def main():
     # Create the pipeline using using the trained modules and save it.
     if accelerator.is_main_process:
         if args.push_to_hub and args.only_save_embeds:
-            logger.warn("Enabling full model saving because --push_to_hub=True was specified.")
+            logger.warning("Enabling full model saving because --push_to_hub=True was specified.")
             save_full_model = True
         else:
             save_full_model = not args.only_save_embeds

@@ -22,14 +22,15 @@ from diffusers.utils.testing_utils import (
     floats_tensor,
     load_image,
     load_numpy,
+    nightly,
     require_torch_gpu,
     skip_mps,
-    slow,
     torch_device,
 )
 
 from ..pipeline_params import TEXT_GUIDED_IMAGE_VARIATION_BATCH_PARAMS, TEXT_GUIDED_IMAGE_VARIATION_PARAMS
 from ..test_pipelines_common import (
+    PipelineKarrasSchedulerTesterMixin,
     PipelineLatentTesterMixin,
     PipelineTesterMixin,
     assert_mean_pixel_difference,
@@ -39,7 +40,9 @@ from ..test_pipelines_common import (
 enable_full_determinism()
 
 
-class StableUnCLIPImg2ImgPipelineFastTests(PipelineLatentTesterMixin, PipelineTesterMixin, unittest.TestCase):
+class StableUnCLIPImg2ImgPipelineFastTests(
+    PipelineLatentTesterMixin, PipelineKarrasSchedulerTesterMixin, PipelineTesterMixin, unittest.TestCase
+):
     pipeline_class = StableUnCLIPImg2ImgPipeline
     params = TEXT_GUIDED_IMAGE_VARIATION_PARAMS
     batch_params = TEXT_GUIDED_IMAGE_VARIATION_BATCH_PARAMS
@@ -193,9 +196,7 @@ class StableUnCLIPImg2ImgPipelineFastTests(PipelineLatentTesterMixin, PipelineTe
     # Overriding PipelineTesterMixin::test_inference_batch_single_identical
     # because undeterminism requires a looser check.
     def test_inference_batch_single_identical(self):
-        test_max_difference = torch_device in ["cpu", "mps"]
-
-        self._test_inference_batch_single_identical(test_max_difference=test_max_difference)
+        self._test_inference_batch_single_identical(expected_max_diff=1e-3)
 
     @unittest.skipIf(
         torch_device != "cuda" or not is_xformers_available(),
@@ -205,7 +206,7 @@ class StableUnCLIPImg2ImgPipelineFastTests(PipelineLatentTesterMixin, PipelineTe
         self._test_xformers_attention_forwardGenerator_pass(test_max_difference=False)
 
 
-@slow
+@nightly
 @require_torch_gpu
 class StableUnCLIPImg2ImgPipelineIntegrationTests(unittest.TestCase):
     def tearDown(self):

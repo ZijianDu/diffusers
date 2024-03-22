@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2023 HuggingFace Inc.
+# Copyright 2024 HuggingFace Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ import unittest
 
 import numpy as np
 import torch
+from huggingface_hub import hf_hub_download
 from transformers import CLIPTextConfig, CLIPTextModel, CLIPTokenizer
 
 from diffusers import (
@@ -29,8 +30,15 @@ from diffusers import (
     StableDiffusionPipeline,
     UNet2DConditionModel,
 )
-from diffusers.utils import load_numpy, slow, torch_device
-from diffusers.utils.testing_utils import enable_full_determinism, require_torch_gpu
+from diffusers.models.attention_processor import AttnProcessor
+from diffusers.utils.testing_utils import (
+    enable_full_determinism,
+    load_numpy,
+    numpy_cosine_similarity_distance,
+    require_torch_gpu,
+    slow,
+    torch_device,
+)
 
 
 enable_full_determinism()
@@ -119,6 +127,7 @@ class StableDiffusion2VPredictionPipelineFastTests(unittest.TestCase):
             tokenizer=tokenizer,
             safety_checker=None,
             feature_extractor=None,
+            image_encoder=None,
             requires_safety_checker=False,
         )
         sd_pipe = sd_pipe.to(device)
@@ -168,6 +177,7 @@ class StableDiffusion2VPredictionPipelineFastTests(unittest.TestCase):
             tokenizer=tokenizer,
             safety_checker=None,
             feature_extractor=None,
+            image_encoder=None,
             requires_safety_checker=False,
         )
         sd_pipe = sd_pipe.to(device)
@@ -228,6 +238,7 @@ class StableDiffusion2VPredictionPipelineFastTests(unittest.TestCase):
             tokenizer=tokenizer,
             safety_checker=None,
             feature_extractor=None,
+            image_encoder=None,
             requires_safety_checker=False,
         )
         sd_pipe = sd_pipe.to(torch_device)
@@ -297,7 +308,7 @@ class StableDiffusion2VPredictionPipelineIntegrationTests(unittest.TestCase):
         prompt = "A painting of a squirrel eating a burger"
         generator = torch.manual_seed(0)
 
-        output = sd_pipe([prompt], generator=generator, num_inference_steps=5, output_type="numpy")
+        output = sd_pipe([prompt], generator=generator, num_inference_steps=5, output_type="np")
         image = output.images
 
         image_slice = image[0, 253:256, 253:256, -1]
@@ -312,7 +323,9 @@ class StableDiffusion2VPredictionPipelineIntegrationTests(unittest.TestCase):
         TODO: update this test after making DPM compatible with V-prediction!
         """
         scheduler = DPMSolverMultistepScheduler.from_pretrained(
-            "stabilityai/stable-diffusion-2", subfolder="scheduler"
+            "stabilityai/stable-diffusion-2",
+            subfolder="scheduler",
+            final_sigmas_type="sigma_min",
         )
         sd_pipe = StableDiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-2", scheduler=scheduler)
         sd_pipe = sd_pipe.to(torch_device)
@@ -322,7 +335,7 @@ class StableDiffusion2VPredictionPipelineIntegrationTests(unittest.TestCase):
         prompt = "a photograph of an astronaut riding a horse"
         generator = torch.manual_seed(0)
         image = sd_pipe(
-            [prompt], generator=generator, guidance_scale=7.5, num_inference_steps=5, output_type="numpy"
+            [prompt], generator=generator, guidance_scale=7.5, num_inference_steps=5, output_type="np"
         ).images
 
         image_slice = image[0, 253:256, 253:256, -1]
@@ -344,7 +357,7 @@ class StableDiffusion2VPredictionPipelineIntegrationTests(unittest.TestCase):
         pipe.enable_attention_slicing()
         generator = torch.manual_seed(0)
         output_chunked = pipe(
-            [prompt], generator=generator, guidance_scale=7.5, num_inference_steps=10, output_type="numpy"
+            [prompt], generator=generator, guidance_scale=7.5, num_inference_steps=10, output_type="np"
         )
         image_chunked = output_chunked.images
 
@@ -356,13 +369,14 @@ class StableDiffusion2VPredictionPipelineIntegrationTests(unittest.TestCase):
         # disable slicing
         pipe.disable_attention_slicing()
         generator = torch.manual_seed(0)
-        output = pipe([prompt], generator=generator, guidance_scale=7.5, num_inference_steps=10, output_type="numpy")
+        output = pipe([prompt], generator=generator, guidance_scale=7.5, num_inference_steps=10, output_type="np")
         image = output.images
 
-        # make sure that more than 5.5 GB is allocated
+        # make sure that more than 3.0 GB is allocated
         mem_bytes = torch.cuda.max_memory_allocated()
-        assert mem_bytes > 5.5 * 10**9
-        assert np.abs(image_chunked.flatten() - image.flatten()).max() < 1e-3
+        assert mem_bytes > 3 * 10**9
+        max_diff = numpy_cosine_similarity_distance(image.flatten(), image_chunked.flatten())
+        assert max_diff < 1e-3
 
     def test_stable_diffusion_text2img_pipeline_v_pred_default(self):
         expected_image = load_numpy(
@@ -382,7 +396,8 @@ class StableDiffusion2VPredictionPipelineIntegrationTests(unittest.TestCase):
         image = output.images[0]
 
         assert image.shape == (768, 768, 3)
-        assert np.abs(expected_image - image).max() < 9e-1
+        max_diff = numpy_cosine_similarity_distance(image.flatten(), expected_image.flatten())
+        assert max_diff < 1e-3
 
     def test_stable_diffusion_text2img_pipeline_unflawed(self):
         expected_image = load_numpy(
@@ -395,17 +410,25 @@ class StableDiffusion2VPredictionPipelineIntegrationTests(unittest.TestCase):
             pipe.scheduler.config, timestep_spacing="trailing", rescale_betas_zero_snr=True
         )
         pipe.to(torch_device)
-        pipe.enable_attention_slicing()
+        pipe.enable_model_cpu_offload()
         pipe.set_progress_bar_config(disable=None)
 
         prompt = "A lion in galaxies, spirals, nebulae, stars, smoke, iridescent, intricate detail, octane render, 8k"
 
-        generator = torch.manual_seed(0)
-        output = pipe(prompt=prompt, guidance_scale=7.5, guidance_rescale=0.7, generator=generator, output_type="np")
+        generator = torch.Generator("cpu").manual_seed(0)
+        output = pipe(
+            prompt=prompt,
+            guidance_scale=7.5,
+            num_inference_steps=10,
+            guidance_rescale=0.7,
+            generator=generator,
+            output_type="np",
+        )
         image = output.images[0]
 
         assert image.shape == (768, 768, 3)
-        assert np.abs(expected_image - image).max() < 5e-1
+        max_diff = numpy_cosine_similarity_distance(image.flatten(), expected_image.flatten())
+        assert max_diff < 5e-2
 
     def test_stable_diffusion_text2img_pipeline_v_pred_fp16(self):
         expected_image = load_numpy(
@@ -424,7 +447,43 @@ class StableDiffusion2VPredictionPipelineIntegrationTests(unittest.TestCase):
         image = output.images[0]
 
         assert image.shape == (768, 768, 3)
-        assert np.abs(expected_image - image).max() < 7.5e-1
+        max_diff = numpy_cosine_similarity_distance(image.flatten(), expected_image.flatten())
+        assert max_diff < 1e-3
+
+    def test_download_local(self):
+        filename = hf_hub_download("stabilityai/stable-diffusion-2-1", filename="v2-1_768-ema-pruned.safetensors")
+
+        pipe = StableDiffusionPipeline.from_single_file(filename, torch_dtype=torch.float16)
+        pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
+        pipe.enable_model_cpu_offload()
+
+        image_out = pipe("test", num_inference_steps=1, output_type="np").images[0]
+
+        assert image_out.shape == (768, 768, 3)
+
+    def test_download_ckpt_diff_format_is_same(self):
+        single_file_path = (
+            "https://huggingface.co/stabilityai/stable-diffusion-2-1/blob/main/v2-1_768-ema-pruned.safetensors"
+        )
+
+        pipe_single = StableDiffusionPipeline.from_single_file(single_file_path)
+        pipe_single.scheduler = DDIMScheduler.from_config(pipe_single.scheduler.config)
+        pipe_single.unet.set_attn_processor(AttnProcessor())
+        pipe_single.enable_model_cpu_offload()
+
+        generator = torch.Generator(device="cpu").manual_seed(0)
+        image_ckpt = pipe_single("a turtle", num_inference_steps=2, generator=generator, output_type="np").images[0]
+
+        pipe = StableDiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-2-1")
+        pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
+        pipe.unet.set_attn_processor(AttnProcessor())
+        pipe.enable_model_cpu_offload()
+
+        generator = torch.Generator(device="cpu").manual_seed(0)
+        image = pipe("a turtle", num_inference_steps=2, generator=generator, output_type="np").images[0]
+
+        max_diff = numpy_cosine_similarity_distance(image.flatten(), image_ckpt.flatten())
+        assert max_diff < 1e-3
 
     def test_stable_diffusion_text2img_intermediate_state_v_pred(self):
         number_of_steps = 0

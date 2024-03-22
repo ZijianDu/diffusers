@@ -1,4 +1,4 @@
-#  Copyright 2023 Custom Diffusion authors. All rights reserved.
+#  Copyright 2024 Custom Diffusion authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -57,7 +57,7 @@ def retrieve(class_prompt, class_data_dir, num_class_images):
             images = class_images[count]
             count += 1
             try:
-                img = requests.get(images["url"])
+                img = requests.get(images["url"], timeout=30)
                 if img.status_code == 200:
                     _ = Image.open(BytesIO(img.content))
                     with open(f"{class_data_dir}/images/{total}.jpg", "wb") as f:

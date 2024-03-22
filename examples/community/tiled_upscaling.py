@@ -1,4 +1,4 @@
-# Copyright 2023 Peter Willemsen <peter@codebuffet.co>. All rights reserved.
+# Copyright 2024 Peter Willemsen <peter@codebuffet.co>. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ import math
 from typing import Callable, List, Optional, Union
 
 import numpy as np
-import PIL
+import PIL.Image
 import torch
 from PIL import Image
 from transformers import CLIPTextModel, CLIPTokenizer

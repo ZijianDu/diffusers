@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2023 HuggingFace Inc.
+# Copyright 2024 HuggingFace Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,27 +17,39 @@ import json
 import os
 import tempfile
 import unittest
+import uuid
 from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
+from huggingface_hub import delete_repo
 
 import diffusers
 from diffusers import (
+    CMStochasticIterativeScheduler,
+    DDIMScheduler,
+    DEISMultistepScheduler,
+    DiffusionPipeline,
+    EDMEulerScheduler,
     EulerAncestralDiscreteScheduler,
     EulerDiscreteScheduler,
     IPNDMScheduler,
     LMSDiscreteScheduler,
+    UniPCMultistepScheduler,
     VQDiffusionScheduler,
-    logging,
 )
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.schedulers.scheduling_utils import SchedulerMixin
-from diffusers.utils import torch_device
-from diffusers.utils.testing_utils import CaptureLogger
+from diffusers.utils import logging
+from diffusers.utils.testing_utils import CaptureLogger, torch_device
+
+from ..others.test_utils import TOKEN, USER, is_staging_test
 
 
 torch.backends.cuda.matmul.allow_tf32 = False
+
+
+logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 class SchedulerObject(SchedulerMixin, ConfigMixin):
@@ -202,10 +214,102 @@ class SchedulerBaseTests(unittest.TestCase):
         assert cap_logger_2.out == "{'f'} was not found in config. Values will be initialized to default values.\n"
         assert cap_logger_3.out == "{'f'} was not found in config. Values will be initialized to default values.\n"
 
+    def test_default_arguments_not_in_config(self):
+        pipe = DiffusionPipeline.from_pretrained(
+            "hf-internal-testing/tiny-stable-diffusion-pipe", torch_dtype=torch.float16
+        )
+        assert pipe.scheduler.__class__ == DDIMScheduler
+
+        # Default for DDIMScheduler
+        assert pipe.scheduler.config.timestep_spacing == "leading"
+
+        # Switch to a different one, verify we use the default for that class
+        pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
+        assert pipe.scheduler.config.timestep_spacing == "linspace"
+
+        # Override with kwargs
+        pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing")
+        assert pipe.scheduler.config.timestep_spacing == "trailing"
+
+        # Verify overridden kwargs stick
+        pipe.scheduler = LMSDiscreteScheduler.from_config(pipe.scheduler.config)
+        assert pipe.scheduler.config.timestep_spacing == "trailing"
+
+        # And stick
+        pipe.scheduler = LMSDiscreteScheduler.from_config(pipe.scheduler.config)
+        assert pipe.scheduler.config.timestep_spacing == "trailing"
+
+    def test_default_solver_type_after_switch(self):
+        pipe = DiffusionPipeline.from_pretrained(
+            "hf-internal-testing/tiny-stable-diffusion-pipe", torch_dtype=torch.float16
+        )
+        assert pipe.scheduler.__class__ == DDIMScheduler
+
+        pipe.scheduler = DEISMultistepScheduler.from_config(pipe.scheduler.config)
+        assert pipe.scheduler.config.solver_type == "logrho"
+
+        # Switch to UniPC, verify the solver is the default
+        pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
+        assert pipe.scheduler.config.solver_type == "bh2"
+
 
 class SchedulerCommonTest(unittest.TestCase):
     scheduler_classes = ()
     forward_default_kwargs = ()
+
+    @property
+    def default_num_inference_steps(self):
+        return 50
+
+    @property
+    def default_timestep(self):
+        kwargs = dict(self.forward_default_kwargs)
+        num_inference_steps = kwargs.get("num_inference_steps", self.default_num_inference_steps)
+
+        try:
+            scheduler_config = self.get_scheduler_config()
+            scheduler = self.scheduler_classes[0](**scheduler_config)
+
+            scheduler.set_timesteps(num_inference_steps)
+            timestep = scheduler.timesteps[0]
+        except NotImplementedError:
+            logger.warning(
+                f"The scheduler {self.__class__.__name__} does not implement a `get_scheduler_config` method."
+                f" `default_timestep` will be set to the default value of 1."
+            )
+            timestep = 1
+
+        return timestep
+
+    # NOTE: currently taking the convention that default_timestep > default_timestep_2 (alternatively,
+    # default_timestep comes earlier in the timestep schedule than default_timestep_2)
+    @property
+    def default_timestep_2(self):
+        kwargs = dict(self.forward_default_kwargs)
+        num_inference_steps = kwargs.get("num_inference_steps", self.default_num_inference_steps)
+
+        try:
+            scheduler_config = self.get_scheduler_config()
+            scheduler = self.scheduler_classes[0](**scheduler_config)
+
+            scheduler.set_timesteps(num_inference_steps)
+            if len(scheduler.timesteps) >= 2:
+                timestep_2 = scheduler.timesteps[1]
+            else:
+                logger.warning(
+                    f"Using num_inference_steps from the scheduler testing class's default config leads to a timestep"
+                    f" scheduler of length {len(scheduler.timesteps)} < 2. The default `default_timestep_2` value of 0"
+                    f" will be used."
+                )
+                timestep_2 = 0
+        except NotImplementedError:
+            logger.warning(
+                f"The scheduler {self.__class__.__name__} does not implement a `get_scheduler_config` method."
+                f" `default_timestep_2` will be set to the default value of 0."
+            )
+            timestep_2 = 0
+
+        return timestep_2
 
     @property
     def dummy_sample(self):
@@ -215,6 +319,21 @@ class SchedulerCommonTest(unittest.TestCase):
         width = 8
 
         sample = torch.rand((batch_size, num_channels, height, width))
+
+        return sample
+
+    @property
+    def dummy_noise_deter(self):
+        batch_size = 4
+        num_channels = 3
+        height = 8
+        width = 8
+
+        num_elems = batch_size * num_channels * height * width
+        sample = torch.arange(num_elems).flip(-1)
+        sample = sample.reshape(num_channels, height, width, batch_size)
+        sample = sample / num_elems
+        sample = sample.permute(3, 0, 1, 2)
 
         return sample
 
@@ -252,6 +371,7 @@ class SchedulerCommonTest(unittest.TestCase):
         kwargs = dict(self.forward_default_kwargs)
 
         num_inference_steps = kwargs.pop("num_inference_steps", None)
+        time_step = time_step if time_step is not None else self.default_timestep
 
         for scheduler_class in self.scheduler_classes:
             # TODO(Suraj) - delete the following two lines once DDPM, DDIM, and PNDM have timesteps casted to float by default
@@ -260,6 +380,14 @@ class SchedulerCommonTest(unittest.TestCase):
 
             scheduler_config = self.get_scheduler_config(**config)
             scheduler = scheduler_class(**scheduler_config)
+
+            if scheduler_class == CMStochasticIterativeScheduler:
+                # Get valid timestep based on sigma_max, which should always be in timestep schedule.
+                scaled_sigma_max = scheduler.sigma_to_t(scheduler.config.sigma_max)
+                time_step = scaled_sigma_max
+
+            if scheduler_class == EDMEulerScheduler:
+                time_step = scheduler.timesteps[-1]
 
             if scheduler_class == VQDiffusionScheduler:
                 num_vec_classes = scheduler_config["num_vec_classes"]
@@ -281,9 +409,13 @@ class SchedulerCommonTest(unittest.TestCase):
                 kwargs["num_inference_steps"] = num_inference_steps
 
             # Make sure `scale_model_input` is invoked to prevent a warning
-            if scheduler_class != VQDiffusionScheduler:
-                _ = scheduler.scale_model_input(sample, 0)
-                _ = new_scheduler.scale_model_input(sample, 0)
+            if scheduler_class == CMStochasticIterativeScheduler:
+                # Get valid timestep based on sigma_max, which should always be in timestep schedule.
+                _ = scheduler.scale_model_input(sample, scaled_sigma_max)
+                _ = new_scheduler.scale_model_input(sample, scaled_sigma_max)
+            elif scheduler_class != VQDiffusionScheduler:
+                _ = scheduler.scale_model_input(sample, scheduler.timesteps[-1])
+                _ = new_scheduler.scale_model_input(sample, scheduler.timesteps[-1])
 
             # Set the seed before step() as some schedulers are stochastic like EulerAncestralDiscreteScheduler, EulerDiscreteScheduler
             if "generator" in set(inspect.signature(scheduler.step).parameters.keys()):
@@ -301,6 +433,7 @@ class SchedulerCommonTest(unittest.TestCase):
         kwargs.update(forward_kwargs)
 
         num_inference_steps = kwargs.pop("num_inference_steps", None)
+        time_step = time_step if time_step is not None else self.default_timestep
 
         for scheduler_class in self.scheduler_classes:
             if scheduler_class in (EulerAncestralDiscreteScheduler, EulerDiscreteScheduler, LMSDiscreteScheduler):
@@ -341,15 +474,19 @@ class SchedulerCommonTest(unittest.TestCase):
     def test_from_save_pretrained(self):
         kwargs = dict(self.forward_default_kwargs)
 
-        num_inference_steps = kwargs.pop("num_inference_steps", None)
+        num_inference_steps = kwargs.pop("num_inference_steps", self.default_num_inference_steps)
 
         for scheduler_class in self.scheduler_classes:
-            timestep = 1
+            timestep = self.default_timestep
             if scheduler_class in (EulerAncestralDiscreteScheduler, EulerDiscreteScheduler, LMSDiscreteScheduler):
                 timestep = float(timestep)
 
             scheduler_config = self.get_scheduler_config()
             scheduler = scheduler_class(**scheduler_config)
+
+            if scheduler_class == CMStochasticIterativeScheduler:
+                # Get valid timestep based on sigma_max, which should always be in timestep schedule.
+                timestep = scheduler.sigma_to_t(scheduler.config.sigma_max)
 
             if scheduler_class == VQDiffusionScheduler:
                 num_vec_classes = scheduler_config["num_vec_classes"]
@@ -414,15 +551,19 @@ class SchedulerCommonTest(unittest.TestCase):
                 scheduler.save_pretrained(tmpdirname)
                 new_scheduler = scheduler_class.from_pretrained(tmpdirname)
 
-            assert scheduler.config == new_scheduler.config
+            # `_use_default_values` should not exist for just saved & loaded scheduler
+            scheduler_config = dict(scheduler.config)
+            del scheduler_config["_use_default_values"]
+
+            assert scheduler_config == new_scheduler.config
 
     def test_step_shape(self):
         kwargs = dict(self.forward_default_kwargs)
 
-        num_inference_steps = kwargs.pop("num_inference_steps", None)
+        num_inference_steps = kwargs.pop("num_inference_steps", self.default_num_inference_steps)
 
-        timestep_0 = 0
-        timestep_1 = 1
+        timestep_0 = self.default_timestep
+        timestep_1 = self.default_timestep_2
 
         for scheduler_class in self.scheduler_classes:
             if scheduler_class in (EulerAncestralDiscreteScheduler, EulerDiscreteScheduler, LMSDiscreteScheduler):
@@ -480,9 +621,9 @@ class SchedulerCommonTest(unittest.TestCase):
                 )
 
         kwargs = dict(self.forward_default_kwargs)
-        num_inference_steps = kwargs.pop("num_inference_steps", 50)
+        num_inference_steps = kwargs.pop("num_inference_steps", self.default_num_inference_steps)
 
-        timestep = 0
+        timestep = self.default_timestep
         if len(self.scheduler_classes) > 0 and self.scheduler_classes[0] == IPNDMScheduler:
             timestep = 1
 
@@ -492,6 +633,10 @@ class SchedulerCommonTest(unittest.TestCase):
 
             scheduler_config = self.get_scheduler_config()
             scheduler = scheduler_class(**scheduler_config)
+
+            if scheduler_class == CMStochasticIterativeScheduler:
+                # Get valid timestep based on sigma_max, which should always be in timestep schedule.
+                timestep = scheduler.sigma_to_t(scheduler.config.sigma_max)
 
             if scheduler_class == VQDiffusionScheduler:
                 num_vec_classes = scheduler_config["num_vec_classes"]
@@ -548,7 +693,14 @@ class SchedulerCommonTest(unittest.TestCase):
 
             if scheduler_class != VQDiffusionScheduler:
                 sample = self.dummy_sample
-                scaled_sample = scheduler.scale_model_input(sample, 0.0)
+                if scheduler_class == CMStochasticIterativeScheduler:
+                    # Get valid timestep based on sigma_max, which should always be in timestep schedule.
+                    scaled_sigma_max = scheduler.sigma_to_t(scheduler.config.sigma_max)
+                    scaled_sample = scheduler.scale_model_input(sample, scaled_sigma_max)
+                elif scheduler_class == EDMEulerScheduler:
+                    scaled_sample = scheduler.scale_model_input(sample, scheduler.timesteps[-1])
+                else:
+                    scaled_sample = scheduler.scale_model_input(sample, 0.0)
                 self.assertEqual(sample.shape, scaled_sample.shape)
 
     def test_add_noise_device(self):
@@ -557,10 +709,17 @@ class SchedulerCommonTest(unittest.TestCase):
                 continue
             scheduler_config = self.get_scheduler_config()
             scheduler = scheduler_class(**scheduler_config)
-            scheduler.set_timesteps(100)
+            scheduler.set_timesteps(self.default_num_inference_steps)
 
             sample = self.dummy_sample.to(torch_device)
-            scaled_sample = scheduler.scale_model_input(sample, 0.0)
+            if scheduler_class == CMStochasticIterativeScheduler:
+                # Get valid timestep based on sigma_max, which should always be in timestep schedule.
+                scaled_sigma_max = scheduler.sigma_to_t(scheduler.config.sigma_max)
+                scaled_sample = scheduler.scale_model_input(sample, scaled_sigma_max)
+            elif scheduler_class == EDMEulerScheduler:
+                scaled_sample = scheduler.scale_model_input(sample, scheduler.timesteps[-1])
+            else:
+                scaled_sample = scheduler.scale_model_input(sample, 0.0)
             self.assertEqual(sample.shape, scaled_sample.shape)
 
             noise = torch.randn_like(scaled_sample).to(torch_device)
@@ -591,7 +750,7 @@ class SchedulerCommonTest(unittest.TestCase):
 
     def test_trained_betas(self):
         for scheduler_class in self.scheduler_classes:
-            if scheduler_class == VQDiffusionScheduler:
+            if scheduler_class in (VQDiffusionScheduler, CMStochasticIterativeScheduler):
                 continue
 
             scheduler_config = self.get_scheduler_config()
@@ -623,7 +782,7 @@ class SchedulerCommonTest(unittest.TestCase):
             # no warning should be thrown
             assert cap_logger.out == ""
 
-            logger = logging.get_logger("diffusers.schedulers.schedulering_utils")
+            logger = logging.get_logger("diffusers.schedulers.scheduling_utils")
             # 30 for warning
             logger.setLevel(30)
             with CaptureLogger(logger) as cap_logger:
@@ -646,3 +805,64 @@ class SchedulerCommonTest(unittest.TestCase):
                 scheduler.does_not_exist
 
             assert str(error.exception) == f"'{type(scheduler).__name__}' object has no attribute 'does_not_exist'"
+
+
+@is_staging_test
+class SchedulerPushToHubTester(unittest.TestCase):
+    identifier = uuid.uuid4()
+    repo_id = f"test-scheduler-{identifier}"
+    org_repo_id = f"valid_org/{repo_id}-org"
+
+    def test_push_to_hub(self):
+        scheduler = DDIMScheduler(
+            beta_start=0.00085,
+            beta_end=0.012,
+            beta_schedule="scaled_linear",
+            clip_sample=False,
+            set_alpha_to_one=False,
+        )
+        scheduler.push_to_hub(self.repo_id, token=TOKEN)
+        scheduler_loaded = DDIMScheduler.from_pretrained(f"{USER}/{self.repo_id}")
+
+        assert type(scheduler) == type(scheduler_loaded)
+
+        # Reset repo
+        delete_repo(token=TOKEN, repo_id=self.repo_id)
+
+        # Push to hub via save_config
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            scheduler.save_config(tmp_dir, repo_id=self.repo_id, push_to_hub=True, token=TOKEN)
+
+        scheduler_loaded = DDIMScheduler.from_pretrained(f"{USER}/{self.repo_id}")
+
+        assert type(scheduler) == type(scheduler_loaded)
+
+        # Reset repo
+        delete_repo(token=TOKEN, repo_id=self.repo_id)
+
+    def test_push_to_hub_in_organization(self):
+        scheduler = DDIMScheduler(
+            beta_start=0.00085,
+            beta_end=0.012,
+            beta_schedule="scaled_linear",
+            clip_sample=False,
+            set_alpha_to_one=False,
+        )
+        scheduler.push_to_hub(self.org_repo_id, token=TOKEN)
+        scheduler_loaded = DDIMScheduler.from_pretrained(self.org_repo_id)
+
+        assert type(scheduler) == type(scheduler_loaded)
+
+        # Reset repo
+        delete_repo(token=TOKEN, repo_id=self.org_repo_id)
+
+        # Push to hub via save_config
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            scheduler.save_config(tmp_dir, repo_id=self.org_repo_id, push_to_hub=True, token=TOKEN)
+
+        scheduler_loaded = DDIMScheduler.from_pretrained(self.org_repo_id)
+
+        assert type(scheduler) == type(scheduler_loaded)
+
+        # Reset repo
+        delete_repo(token=TOKEN, repo_id=self.org_repo_id)

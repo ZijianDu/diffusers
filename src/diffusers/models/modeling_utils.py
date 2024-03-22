@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2023 The HuggingFace Inc. team.
+# Copyright 2024 The HuggingFace Inc. team.
 # Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,28 +18,32 @@ import inspect
 import itertools
 import os
 import re
+from collections import OrderedDict
 from functools import partial
+from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple, Union
 
+import safetensors
 import torch
-from torch import Tensor, device, nn
+from huggingface_hub import create_repo
+from huggingface_hub.utils import validate_hf_hub_args
+from torch import Tensor, nn
 
 from .. import __version__
 from ..utils import (
     CONFIG_NAME,
-    DIFFUSERS_CACHE,
     FLAX_WEIGHTS_NAME,
-    HF_HUB_OFFLINE,
+    SAFETENSORS_FILE_EXTENSION,
     SAFETENSORS_WEIGHTS_NAME,
     WEIGHTS_NAME,
     _add_variant,
     _get_model_file,
     deprecate,
     is_accelerate_available,
-    is_safetensors_available,
     is_torch_version,
     logging,
 )
+from ..utils.hub_utils import PushToHubMixin, load_or_create_model_card, populate_model_card
 
 
 logger = logging.get_logger(__name__)
@@ -56,11 +60,8 @@ if is_accelerate_available():
     from accelerate.utils import set_module_tensor_to_device
     from accelerate.utils.versions import is_torch_version
 
-if is_safetensors_available():
-    import safetensors
 
-
-def get_parameter_device(parameter: torch.nn.Module):
+def get_parameter_device(parameter: torch.nn.Module) -> torch.device:
     try:
         parameters_and_buffers = itertools.chain(parameter.parameters(), parameter.buffers())
         return next(parameters_and_buffers).device
@@ -76,7 +77,7 @@ def get_parameter_device(parameter: torch.nn.Module):
         return first_tuple[1].device
 
 
-def get_parameter_dtype(parameter: torch.nn.Module):
+def get_parameter_dtype(parameter: torch.nn.Module) -> torch.dtype:
     try:
         params = tuple(parameter.parameters())
         if len(params) > 0:
@@ -103,10 +104,16 @@ def load_state_dict(checkpoint_file: Union[str, os.PathLike], variant: Optional[
     Reads a checkpoint file, returning properly formatted errors if they arise.
     """
     try:
-        if os.path.basename(checkpoint_file) == _add_variant(WEIGHTS_NAME, variant):
-            return torch.load(checkpoint_file, map_location="cpu")
-        else:
+        file_extension = os.path.basename(checkpoint_file).split(".")[-1]
+        if file_extension == SAFETENSORS_FILE_EXTENSION:
             return safetensors.torch.load_file(checkpoint_file, device="cpu")
+        else:
+            weights_only_kwarg = {"weights_only": True} if is_torch_version(">=", "1.13") else {}
+            return torch.load(
+                checkpoint_file,
+                map_location="cpu",
+                **weights_only_kwarg,
+            )
     except Exception as e:
         try:
             with open(checkpoint_file) as f:
@@ -123,13 +130,43 @@ def load_state_dict(checkpoint_file: Union[str, os.PathLike], variant: Optional[
                     ) from e
         except (UnicodeDecodeError, ValueError):
             raise OSError(
-                f"Unable to load weights from checkpoint file for '{checkpoint_file}' "
-                f"at '{checkpoint_file}'. "
-                "If you tried to load a PyTorch model from a TF 2.0 checkpoint, please set from_tf=True."
+                f"Unable to load weights from checkpoint file for '{checkpoint_file}' " f"at '{checkpoint_file}'. "
             )
 
 
-def _load_state_dict_into_model(model_to_load, state_dict):
+def load_model_dict_into_meta(
+    model,
+    state_dict: OrderedDict,
+    device: Optional[Union[str, torch.device]] = None,
+    dtype: Optional[Union[str, torch.dtype]] = None,
+    model_name_or_path: Optional[str] = None,
+) -> List[str]:
+    device = device or torch.device("cpu")
+    dtype = dtype or torch.float32
+
+    accepts_dtype = "dtype" in set(inspect.signature(set_module_tensor_to_device).parameters.keys())
+
+    unexpected_keys = []
+    empty_state_dict = model.state_dict()
+    for param_name, param in state_dict.items():
+        if param_name not in empty_state_dict:
+            unexpected_keys.append(param_name)
+            continue
+
+        if empty_state_dict[param_name].shape != param.shape:
+            model_name_or_path_str = f"{model_name_or_path} " if model_name_or_path is not None else ""
+            raise ValueError(
+                f"Cannot load {model_name_or_path_str}because {param_name} expected shape {empty_state_dict[param_name]}, but got {param.shape}. If you want to instead overwrite randomly initialized weights, please make sure to pass both `low_cpu_mem_usage=False` and `ignore_mismatched_sizes=True`. For more information, see also: https://github.com/huggingface/diffusers/issues/1619#issuecomment-1345604389 as an example."
+            )
+
+        if accepts_dtype:
+            set_module_tensor_to_device(model, param_name, device, value=param, dtype=dtype)
+        else:
+            set_module_tensor_to_device(model, param_name, device, value=param)
+    return unexpected_keys
+
+
+def _load_state_dict_into_model(model_to_load, state_dict: OrderedDict) -> List[str]:
     # Convert old format to new format if needed from a PyTorch state_dict
     # copy state_dict so _load_from_state_dict can modify it
     state_dict = state_dict.copy()
@@ -137,7 +174,7 @@ def _load_state_dict_into_model(model_to_load, state_dict):
 
     # PyTorch's `_load_from_state_dict` does not copy parameters in a module's descendants
     # so we need to apply the function recursively.
-    def load(module: torch.nn.Module, prefix=""):
+    def load(module: torch.nn.Module, prefix: str = ""):
         args = (state_dict, prefix, {}, True, [], [], error_msgs)
         module._load_from_state_dict(*args)
 
@@ -150,7 +187,7 @@ def _load_state_dict_into_model(model_to_load, state_dict):
     return error_msgs
 
 
-class ModelMixin(torch.nn.Module):
+class ModelMixin(torch.nn.Module, PushToHubMixin):
     r"""
     Base class for all models.
 
@@ -159,6 +196,7 @@ class ModelMixin(torch.nn.Module):
 
         - **config_name** ([`str`]) -- Filename to save a model to when calling [`~models.ModelMixin.save_pretrained`].
     """
+
     config_name = CONFIG_NAME
     _automatically_saved_args = ["_diffusers_version", "_class_name", "_name_or_path"]
     _supports_gradient_checkpointing = False
@@ -192,7 +230,7 @@ class ModelMixin(torch.nn.Module):
         """
         return any(hasattr(m, "gradient_checkpointing") and m.gradient_checkpointing for m in self.modules())
 
-    def enable_gradient_checkpointing(self):
+    def enable_gradient_checkpointing(self) -> None:
         """
         Activates gradient checkpointing for the current model (may be referred to as *activation checkpointing* or
         *checkpoint activations* in other frameworks).
@@ -201,7 +239,7 @@ class ModelMixin(torch.nn.Module):
             raise ValueError(f"{self.__class__.__name__} does not support gradient checkpointing.")
         self.apply(partial(self._set_gradient_checkpointing, value=True))
 
-    def disable_gradient_checkpointing(self):
+    def disable_gradient_checkpointing(self) -> None:
         """
         Deactivates gradient checkpointing for the current model (may be referred to as *activation checkpointing* or
         *checkpoint activations* in other frameworks).
@@ -226,7 +264,7 @@ class ModelMixin(torch.nn.Module):
             if isinstance(module, torch.nn.Module):
                 fn_recursive_set_mem_eff(module)
 
-    def enable_xformers_memory_efficient_attention(self, attention_op: Optional[Callable] = None):
+    def enable_xformers_memory_efficient_attention(self, attention_op: Optional[Callable] = None) -> None:
         r"""
         Enable memory efficient attention from [xFormers](https://facebookresearch.github.io/xformers/).
 
@@ -262,7 +300,7 @@ class ModelMixin(torch.nn.Module):
         """
         self.set_use_memory_efficient_attention_xformers(True, attention_op)
 
-    def disable_xformers_memory_efficient_attention(self):
+    def disable_xformers_memory_efficient_attention(self) -> None:
         r"""
         Disable memory efficient attention from [xFormers](https://facebookresearch.github.io/xformers/).
         """
@@ -272,9 +310,11 @@ class ModelMixin(torch.nn.Module):
         self,
         save_directory: Union[str, os.PathLike],
         is_main_process: bool = True,
-        save_function: Callable = None,
-        safe_serialization: bool = False,
+        save_function: Optional[Callable] = None,
+        safe_serialization: bool = True,
         variant: Optional[str] = None,
+        push_to_hub: bool = False,
+        **kwargs,
     ):
         """
         Save a model and its configuration file to a directory so that it can be reloaded using the
@@ -291,20 +331,32 @@ class ModelMixin(torch.nn.Module):
                 The function to use to save the state dictionary. Useful during distributed training when you need to
                 replace `torch.save` with another method. Can be configured with the environment variable
                 `DIFFUSERS_SAVE_MODE`.
-            safe_serialization (`bool`, *optional*, defaults to `False`):
+            safe_serialization (`bool`, *optional*, defaults to `True`):
                 Whether to save the model using `safetensors` or the traditional PyTorch way with `pickle`.
             variant (`str`, *optional*):
                 If specified, weights are saved in the format `pytorch_model.<variant>.bin`.
+            push_to_hub (`bool`, *optional*, defaults to `False`):
+                Whether or not to push your model to the Hugging Face Hub after saving it. You can specify the
+                repository you want to push to with `repo_id` (will default to the name of `save_directory` in your
+                namespace).
+            kwargs (`Dict[str, Any]`, *optional*):
+                Additional keyword arguments passed along to the [`~utils.PushToHubMixin.push_to_hub`] method.
         """
-        if safe_serialization and not is_safetensors_available():
-            raise ImportError("`safe_serialization` requires the `safetensors library: `pip install safetensors`.")
-
         if os.path.isfile(save_directory):
             logger.error(f"Provided path ({save_directory}) should be a directory, not a file")
             return
 
         os.makedirs(save_directory, exist_ok=True)
 
+        if push_to_hub:
+            commit_message = kwargs.pop("commit_message", None)
+            private = kwargs.pop("private", False)
+            create_pr = kwargs.pop("create_pr", False)
+            token = kwargs.pop("token", None)
+            repo_id = kwargs.pop("repo_id", save_directory.split(os.path.sep)[-1])
+            repo_id = create_repo(repo_id, exist_ok=True, private=private, token=token).repo_id
+
+        # Only save the model itself if we are using distributed training
         model_to_save = self
 
         # Attach architecture to the config
@@ -321,14 +373,29 @@ class ModelMixin(torch.nn.Module):
         # Save the model
         if safe_serialization:
             safetensors.torch.save_file(
-                state_dict, os.path.join(save_directory, weights_name), metadata={"format": "pt"}
+                state_dict, Path(save_directory, weights_name).as_posix(), metadata={"format": "pt"}
             )
         else:
-            torch.save(state_dict, os.path.join(save_directory, weights_name))
+            torch.save(state_dict, Path(save_directory, weights_name).as_posix())
 
-        logger.info(f"Model weights saved in {os.path.join(save_directory, weights_name)}")
+        logger.info(f"Model weights saved in {Path(save_directory, weights_name).as_posix()}")
+
+        if push_to_hub:
+            # Create a new empty model card and eventually tag it
+            model_card = load_or_create_model_card(repo_id, token=token)
+            model_card = populate_model_card(model_card)
+            model_card.save(Path(save_directory, "README.md").as_posix())
+
+            self._upload_folder(
+                save_directory,
+                repo_id,
+                token=token,
+                commit_message=commit_message,
+                create_pr=create_pr,
+            )
 
     @classmethod
+    @validate_hf_hub_args
     def from_pretrained(cls, pretrained_model_name_or_path: Optional[Union[str, os.PathLike]], **kwargs):
         r"""
         Instantiate a pretrained PyTorch model from a pretrained model configuration.
@@ -365,7 +432,7 @@ class ModelMixin(torch.nn.Module):
             local_files_only(`bool`, *optional*, defaults to `False`):
                 Whether to only load local model weights and configuration files or not. If set to `True`, the model
                 won't be downloaded from the Hub.
-            use_auth_token (`str` or *bool*, *optional*):
+            token (`str` or *bool*, *optional*):
                 The token to use as HTTP bearer authorization for remote files. If `True`, the token generated from
                 `diffusers-cli login` (stored in `~/.huggingface`) is used.
             revision (`str`, *optional*, defaults to `"main"`):
@@ -434,15 +501,15 @@ class ModelMixin(torch.nn.Module):
         You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
         ```
         """
-        cache_dir = kwargs.pop("cache_dir", DIFFUSERS_CACHE)
+        cache_dir = kwargs.pop("cache_dir", None)
         ignore_mismatched_sizes = kwargs.pop("ignore_mismatched_sizes", False)
         force_download = kwargs.pop("force_download", False)
         from_flax = kwargs.pop("from_flax", False)
         resume_download = kwargs.pop("resume_download", False)
         proxies = kwargs.pop("proxies", None)
         output_loading_info = kwargs.pop("output_loading_info", False)
-        local_files_only = kwargs.pop("local_files_only", HF_HUB_OFFLINE)
-        use_auth_token = kwargs.pop("use_auth_token", None)
+        local_files_only = kwargs.pop("local_files_only", None)
+        token = kwargs.pop("token", None)
         revision = kwargs.pop("revision", None)
         torch_dtype = kwargs.pop("torch_dtype", None)
         subfolder = kwargs.pop("subfolder", None)
@@ -454,14 +521,9 @@ class ModelMixin(torch.nn.Module):
         variant = kwargs.pop("variant", None)
         use_safetensors = kwargs.pop("use_safetensors", None)
 
-        if use_safetensors and not is_safetensors_available():
-            raise ValueError(
-                "`use_safetensors`=True but safetensors is not installed. Please install safetensors with `pip install safetenstors"
-            )
-
         allow_pickle = False
         if use_safetensors is None:
-            use_safetensors = is_safetensors_available()
+            use_safetensors = True
             allow_pickle = True
 
         if low_cpu_mem_usage and not is_accelerate_available():
@@ -517,7 +579,7 @@ class ModelMixin(torch.nn.Module):
             resume_download=resume_download,
             proxies=proxies,
             local_files_only=local_files_only,
-            use_auth_token=use_auth_token,
+            token=token,
             revision=revision,
             subfolder=subfolder,
             device_map=device_map,
@@ -539,7 +601,7 @@ class ModelMixin(torch.nn.Module):
                 resume_download=resume_download,
                 proxies=proxies,
                 local_files_only=local_files_only,
-                use_auth_token=use_auth_token,
+                token=token,
                 revision=revision,
                 subfolder=subfolder,
                 user_agent=user_agent,
@@ -562,7 +624,7 @@ class ModelMixin(torch.nn.Module):
                         resume_download=resume_download,
                         proxies=proxies,
                         local_files_only=local_files_only,
-                        use_auth_token=use_auth_token,
+                        token=token,
                         revision=revision,
                         subfolder=subfolder,
                         user_agent=user_agent,
@@ -581,7 +643,7 @@ class ModelMixin(torch.nn.Module):
                     resume_download=resume_download,
                     proxies=proxies,
                     local_files_only=local_files_only,
-                    use_auth_token=use_auth_token,
+                    token=token,
                     revision=revision,
                     subfolder=subfolder,
                     user_agent=user_agent,
@@ -607,36 +669,21 @@ class ModelMixin(torch.nn.Module):
                             " `low_cpu_mem_usage=False` and `device_map=None` if you want to randomly initialize"
                             " those weights or else make sure your checkpoint file is correct."
                         )
-                    unexpected_keys = []
 
-                    empty_state_dict = model.state_dict()
-                    for param_name, param in state_dict.items():
-                        accepts_dtype = "dtype" in set(
-                            inspect.signature(set_module_tensor_to_device).parameters.keys()
-                        )
-
-                        if param_name not in empty_state_dict:
-                            unexpected_keys.append(param_name)
-                            continue
-
-                        if empty_state_dict[param_name].shape != param.shape:
-                            raise ValueError(
-                                f"Cannot load {pretrained_model_name_or_path} because {param_name} expected shape {empty_state_dict[param_name]}, but got {param.shape}. If you want to instead overwrite randomly initialized weights, please make sure to pass both `low_cpu_mem_usage=False` and `ignore_mismatched_sizes=True`. For more information, see also: https://github.com/huggingface/diffusers/issues/1619#issuecomment-1345604389 as an example."
-                            )
-
-                        if accepts_dtype:
-                            set_module_tensor_to_device(
-                                model, param_name, param_device, value=param, dtype=torch_dtype
-                            )
-                        else:
-                            set_module_tensor_to_device(model, param_name, param_device, value=param)
+                    unexpected_keys = load_model_dict_into_meta(
+                        model,
+                        state_dict,
+                        device=param_device,
+                        dtype=torch_dtype,
+                        model_name_or_path=pretrained_model_name_or_path,
+                    )
 
                     if cls._keys_to_ignore_on_load_unexpected is not None:
                         for pat in cls._keys_to_ignore_on_load_unexpected:
                             unexpected_keys = [k for k in unexpected_keys if re.search(pat, k) is None]
 
                     if len(unexpected_keys) > 0:
-                        logger.warn(
+                        logger.warning(
                             f"Some weights of the model checkpoint were not used when initializing {cls.__name__}: \n {[', '.join(unexpected_keys)]}"
                         )
 
@@ -664,7 +711,7 @@ class ModelMixin(torch.nn.Module):
                         # the weights so we don't have to do this again.
 
                         if "'Attention' object has no attribute" in str(e):
-                            logger.warn(
+                            logger.warning(
                                 f"Taking `{str(e)}` while using `accelerate.load_checkpoint_and_dispatch` to mean {pretrained_model_name_or_path}"
                                 " was saved with deprecated attention block weight names. We will load it with the deprecated attention block"
                                 " names and convert them on the fly to the new attention block format. Please re-save the model after this conversion,"
@@ -732,10 +779,10 @@ class ModelMixin(torch.nn.Module):
     def _load_pretrained_model(
         cls,
         model,
-        state_dict,
+        state_dict: OrderedDict,
         resolved_archive_file,
-        pretrained_model_name_or_path,
-        ignore_mismatched_sizes=False,
+        pretrained_model_name_or_path: Union[str, os.PathLike],
+        ignore_mismatched_sizes: bool = False,
     ):
         # Retrieve missing & unexpected_keys
         model_state_dict = model.state_dict()
@@ -833,7 +880,7 @@ class ModelMixin(torch.nn.Module):
         return model, missing_keys, unexpected_keys, mismatched_keys, error_msgs
 
     @property
-    def device(self) -> device:
+    def device(self) -> torch.device:
         """
         `torch.device`: The device on which the module is (assuming that all the module parameters are on the same
         device).
@@ -885,7 +932,7 @@ class ModelMixin(torch.nn.Module):
         else:
             return sum(p.numel() for p in self.parameters() if p.requires_grad or not only_trainable)
 
-    def _convert_deprecated_attention_blocks(self, state_dict):
+    def _convert_deprecated_attention_blocks(self, state_dict: OrderedDict) -> None:
         deprecated_attention_block_paths = []
 
         def recursive_find_attn_block(name, module):
@@ -929,7 +976,7 @@ class ModelMixin(torch.nn.Module):
             if f"{path}.proj_attn.bias" in state_dict:
                 state_dict[f"{path}.to_out.0.bias"] = state_dict.pop(f"{path}.proj_attn.bias")
 
-    def _temp_convert_self_to_deprecated_attention_blocks(self):
+    def _temp_convert_self_to_deprecated_attention_blocks(self) -> None:
         deprecated_attention_block_modules = []
 
         def recursive_find_attn_block(module):
@@ -956,10 +1003,10 @@ class ModelMixin(torch.nn.Module):
             del module.to_v
             del module.to_out
 
-    def _undo_temp_convert_self_to_deprecated_attention_blocks(self):
+    def _undo_temp_convert_self_to_deprecated_attention_blocks(self) -> None:
         deprecated_attention_block_modules = []
 
-        def recursive_find_attn_block(module):
+        def recursive_find_attn_block(module) -> None:
             if hasattr(module, "_from_deprecated_attn_block") and module._from_deprecated_attn_block:
                 deprecated_attention_block_modules.append(module)
 

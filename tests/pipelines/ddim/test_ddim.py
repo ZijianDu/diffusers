@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2023 HuggingFace Inc.
+# Copyright 2024 HuggingFace Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -38,7 +38,6 @@ class DDIMPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
         "callback_steps",
     }
     batch_params = UNCONDITIONAL_IMAGE_GENERATION_BATCH_PARAMS
-    test_cpu_offload = False
 
     def get_dummy_components(self):
         torch.manual_seed(0)
@@ -64,7 +63,7 @@ class DDIMPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
             "batch_size": 1,
             "generator": generator,
             "num_inference_steps": 2,
-            "output_type": "numpy",
+            "output_type": "np",
         }
         return inputs
 
@@ -114,7 +113,7 @@ class DDIMPipelineIntegrationTests(unittest.TestCase):
         ddim.set_progress_bar_config(disable=None)
 
         generator = torch.manual_seed(0)
-        image = ddim(generator=generator, eta=0.0, output_type="numpy").images
+        image = ddim(generator=generator, eta=0.0, output_type="np").images
 
         image_slice = image[0, -3:, -3:, -1]
 
@@ -134,7 +133,7 @@ class DDIMPipelineIntegrationTests(unittest.TestCase):
         ddpm.set_progress_bar_config(disable=None)
 
         generator = torch.manual_seed(0)
-        image = ddpm(generator=generator, output_type="numpy").images
+        image = ddpm(generator=generator, output_type="np").images
 
         image_slice = image[0, -3:, -3:, -1]
 

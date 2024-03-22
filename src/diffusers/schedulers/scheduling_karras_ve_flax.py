@@ -1,4 +1,4 @@
-# Copyright 2023 NVIDIA and The HuggingFace Team. All rights reserved.
+# Copyright 2024 NVIDIA and The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import flax
+import jax
 import jax.numpy as jnp
 from jax import random
 
@@ -139,7 +140,7 @@ class FlaxKarrasVeScheduler(FlaxSchedulerMixin, ConfigMixin):
         state: KarrasVeSchedulerState,
         sample: jnp.ndarray,
         sigma: float,
-        key: random.KeyArray,
+        key: jax.Array,
     ) -> Tuple[jnp.ndarray, float]:
         """
         Explicit Langevin-like "churn" step of adding noise to the sample according to a factor gamma_i ≥ 0 to reach a

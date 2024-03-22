@@ -1,4 +1,4 @@
-# Copyright 2023 The HuggingFace Team. All rights reserved.
+# Copyright 2024 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,12 +14,15 @@
 """
 Import utilities: Utilities related to imports and our lazy inits.
 """
+
 import importlib.util
 import operator as op
 import os
 import sys
 from collections import OrderedDict
-from typing import Union
+from itertools import chain
+from types import ModuleType
+from typing import Any, Union
 
 from huggingface_hub.utils import is_jinja_available  # noqa: F401
 from packaging import version
@@ -44,6 +47,8 @@ USE_TF = os.environ.get("USE_TF", "AUTO").upper()
 USE_TORCH = os.environ.get("USE_TORCH", "AUTO").upper()
 USE_JAX = os.environ.get("USE_FLAX", "AUTO").upper()
 USE_SAFETENSORS = os.environ.get("USE_SAFETENSORS", "AUTO").upper()
+DIFFUSERS_SLOW_IMPORT = os.environ.get("DIFFUSERS_SLOW_IMPORT", "FALSE").upper()
+DIFFUSERS_SLOW_IMPORT = DIFFUSERS_SLOW_IMPORT in ENV_VARS_TRUE_VALUES
 
 STR_OPERATION_TO_FUNC = {">": op.gt, ">=": op.ge, "==": op.eq, "!=": op.ne, "<=": op.le, "<": op.lt}
 
@@ -60,42 +65,22 @@ else:
     logger.info("Disabling PyTorch because USE_TORCH is set")
     _torch_available = False
 
+_torch_xla_available = importlib.util.find_spec("torch_xla") is not None
+if _torch_xla_available:
+    try:
+        _torch_xla_version = importlib_metadata.version("torch_xla")
+        logger.info(f"PyTorch XLA version {_torch_xla_version} available.")
+    except ImportError:
+        _torch_xla_available = False
 
-_tf_version = "N/A"
-if USE_TF in ENV_VARS_TRUE_AND_AUTO_VALUES and USE_TORCH not in ENV_VARS_TRUE_VALUES:
-    _tf_available = importlib.util.find_spec("tensorflow") is not None
-    if _tf_available:
-        candidates = (
-            "tensorflow",
-            "tensorflow-cpu",
-            "tensorflow-gpu",
-            "tf-nightly",
-            "tf-nightly-cpu",
-            "tf-nightly-gpu",
-            "intel-tensorflow",
-            "intel-tensorflow-avx512",
-            "tensorflow-rocm",
-            "tensorflow-macos",
-            "tensorflow-aarch64",
-        )
-        _tf_version = None
-        # For the metadata, we have to look for both tensorflow and tensorflow-cpu
-        for pkg in candidates:
-            try:
-                _tf_version = importlib_metadata.version(pkg)
-                break
-            except importlib_metadata.PackageNotFoundError:
-                pass
-        _tf_available = _tf_version is not None
-    if _tf_available:
-        if version.parse(_tf_version) < version.parse("2"):
-            logger.info(f"TensorFlow found but with version {_tf_version}. Diffusers requires version 2 minimum.")
-            _tf_available = False
-        else:
-            logger.info(f"TensorFlow version {_tf_version} available.")
-else:
-    logger.info("Disabling Tensorflow because USE_TORCH is set")
-    _tf_available = False
+# check whether torch_npu is available
+_torch_npu_available = importlib.util.find_spec("torch_npu") is not None
+if _torch_npu_available:
+    try:
+        _torch_npu_version = importlib_metadata.version("torch_npu")
+        logger.info(f"torch_npu version {_torch_npu_version} available.")
+    except ImportError:
+        _torch_npu_available = False
 
 _jax_version = "N/A"
 _flax_version = "N/A"
@@ -219,10 +204,10 @@ _xformers_available = importlib.util.find_spec("xformers") is not None
 try:
     _xformers_version = importlib_metadata.version("xformers")
     if _torch_available:
-        import torch
+        _torch_version = importlib_metadata.version("torch")
+        if version.Version(_torch_version) < version.Version("1.12"):
+            raise ValueError("xformers is installed in your environment and requires PyTorch >= 1.12")
 
-        if version.Version(torch.__version__) < version.Version("1.12"):
-            raise ValueError("PyTorch should be >= 1.12")
     logger.debug(f"Successfully imported xformers version {_xformers_version}")
 except importlib_metadata.PackageNotFoundError:
     _xformers_available = False
@@ -248,12 +233,6 @@ try:
 except importlib_metadata.PackageNotFoundError:
     _wandb_available = False
 
-_omegaconf_available = importlib.util.find_spec("omegaconf") is not None
-try:
-    _omegaconf_version = importlib_metadata.version("omegaconf")
-    logger.debug(f"Successfully imported omegaconf version {_omegaconf_version}")
-except importlib_metadata.PackageNotFoundError:
-    _omegaconf_available = False
 
 _tensorboard_available = importlib.util.find_spec("tensorboard")
 try:
@@ -294,17 +273,39 @@ try:
 except importlib_metadata.PackageNotFoundError:
     _torchsde_available = False
 
+_invisible_watermark_available = importlib.util.find_spec("imwatermark") is not None
+try:
+    _invisible_watermark_version = importlib_metadata.version("invisible-watermark")
+    logger.debug(f"Successfully imported invisible-watermark version {_invisible_watermark_version}")
+except importlib_metadata.PackageNotFoundError:
+    _invisible_watermark_available = False
+
+
+_peft_available = importlib.util.find_spec("peft") is not None
+try:
+    _peft_version = importlib_metadata.version("peft")
+    logger.debug(f"Successfully imported peft version {_peft_version}")
+except importlib_metadata.PackageNotFoundError:
+    _peft_available = False
+
+_torchvision_available = importlib.util.find_spec("torchvision") is not None
+try:
+    _torchvision_version = importlib_metadata.version("torchvision")
+    logger.debug(f"Successfully imported torchvision version {_torchvision_version}")
+except importlib_metadata.PackageNotFoundError:
+    _torchvision_available = False
+
 
 def is_torch_available():
     return _torch_available
 
 
-def is_safetensors_available():
-    return _safetensors_available
+def is_torch_xla_available():
+    return _torch_xla_available
 
 
-def is_tf_available():
-    return _tf_available
+def is_torch_npu_available():
+    return _torch_npu_available
 
 
 def is_flax_available():
@@ -359,10 +360,6 @@ def is_wandb_available():
     return _wandb_available
 
 
-def is_omegaconf_available():
-    return _omegaconf_available
-
-
 def is_tensorboard_available():
     return _tensorboard_available
 
@@ -381,6 +378,18 @@ def is_bs4_available():
 
 def is_torchsde_available():
     return _torchsde_available
+
+
+def is_invisible_watermark_available():
+    return _invisible_watermark_available
+
+
+def is_peft_available():
+    return _peft_available
+
+
+def is_torchvision_available():
+    return _torchvision_available
 
 
 # docstyle-ignore
@@ -456,12 +465,6 @@ install wandb`
 """
 
 # docstyle-ignore
-OMEGACONF_IMPORT_ERROR = """
-{0} requires the omegaconf library but it was not found in your environment. You can install it with pip: `pip
-install omegaconf`
-"""
-
-# docstyle-ignore
 TENSORBOARD_IMPORT_ERROR = """
 {0} requires the tensorboard library but it was not found in your environment. You can install it with pip: `pip
 install tensorboard`
@@ -491,6 +494,11 @@ TORCHSDE_IMPORT_ERROR = """
 {0} requires the torchsde library but it was not found in your environment. You can install it with pip: `pip install torchsde`
 """
 
+# docstyle-ignore
+INVISIBLE_WATERMARK_IMPORT_ERROR = """
+{0} requires the invisible-watermark library but it was not found in your environment. You can install it with pip: `pip install invisible-watermark>=0.2.0`
+"""
+
 
 BACKENDS_MAPPING = OrderedDict(
     [
@@ -507,11 +515,11 @@ BACKENDS_MAPPING = OrderedDict(
         ("k_diffusion", (is_k_diffusion_available, K_DIFFUSION_IMPORT_ERROR)),
         ("note_seq", (is_note_seq_available, NOTE_SEQ_IMPORT_ERROR)),
         ("wandb", (is_wandb_available, WANDB_IMPORT_ERROR)),
-        ("omegaconf", (is_omegaconf_available, OMEGACONF_IMPORT_ERROR)),
-        ("tensorboard", (_tensorboard_available, TENSORBOARD_IMPORT_ERROR)),
-        ("compel", (_compel_available, COMPEL_IMPORT_ERROR)),
+        ("tensorboard", (is_tensorboard_available, TENSORBOARD_IMPORT_ERROR)),
+        ("compel", (is_compel_available, COMPEL_IMPORT_ERROR)),
         ("ftfy", (is_ftfy_available, FTFY_IMPORT_ERROR)),
-        ("torchsde", (_torchsde_available, TORCHSDE_IMPORT_ERROR)),
+        ("torchsde", (is_torchsde_available, TORCHSDE_IMPORT_ERROR)),
+        ("invisible_watermark", (is_invisible_watermark_available, INVISIBLE_WATERMARK_IMPORT_ERROR)),
     ]
 )
 
@@ -554,7 +562,7 @@ class DummyObject(type):
     """
 
     def __getattr__(cls, key):
-        if key.startswith("_"):
+        if key.startswith("_") and key not in ["_load_connected_pipes", "_is_onnx"]:
             return super().__getattr__(cls, key)
         requires_backends(cls, cls._backends)
 
@@ -634,5 +642,85 @@ def is_k_diffusion_version(operation: str, version: str):
     return compare_versions(parse(_k_diffusion_version), operation, version)
 
 
+def get_objects_from_module(module):
+    """
+    Args:
+    Returns a dict of object names and values in a module, while skipping private/internal objects
+        module (ModuleType):
+            Module to extract the objects from.
+
+    Returns:
+        dict: Dictionary of object names and corresponding values
+    """
+
+    objects = {}
+    for name in dir(module):
+        if name.startswith("_"):
+            continue
+        objects[name] = getattr(module, name)
+
+    return objects
+
+
 class OptionalDependencyNotAvailable(BaseException):
     """An error indicating that an optional dependency of Diffusers was not found in the environment."""
+
+
+class _LazyModule(ModuleType):
+    """
+    Module class that surfaces all objects but only performs associated imports when the objects are requested.
+    """
+
+    # Very heavily inspired by optuna.integration._IntegrationModule
+    # https://github.com/optuna/optuna/blob/master/optuna/integration/__init__.py
+    def __init__(self, name, module_file, import_structure, module_spec=None, extra_objects=None):
+        super().__init__(name)
+        self._modules = set(import_structure.keys())
+        self._class_to_module = {}
+        for key, values in import_structure.items():
+            for value in values:
+                self._class_to_module[value] = key
+        # Needed for autocompletion in an IDE
+        self.__all__ = list(import_structure.keys()) + list(chain(*import_structure.values()))
+        self.__file__ = module_file
+        self.__spec__ = module_spec
+        self.__path__ = [os.path.dirname(module_file)]
+        self._objects = {} if extra_objects is None else extra_objects
+        self._name = name
+        self._import_structure = import_structure
+
+    # Needed for autocompletion in an IDE
+    def __dir__(self):
+        result = super().__dir__()
+        # The elements of self.__all__ that are submodules may or may not be in the dir already, depending on whether
+        # they have been accessed or not. So we only add the elements of self.__all__ that are not already in the dir.
+        for attr in self.__all__:
+            if attr not in result:
+                result.append(attr)
+        return result
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self._objects:
+            return self._objects[name]
+        if name in self._modules:
+            value = self._get_module(name)
+        elif name in self._class_to_module.keys():
+            module = self._get_module(self._class_to_module[name])
+            value = getattr(module, name)
+        else:
+            raise AttributeError(f"module {self.__name__} has no attribute {name}")
+
+        setattr(self, name, value)
+        return value
+
+    def _get_module(self, module_name: str):
+        try:
+            return importlib.import_module("." + module_name, self.__name__)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to import {self.__name__}.{module_name} because of the following error (look up to see its"
+                f" traceback):\n{e}"
+            ) from e
+
+    def __reduce__(self):
+        return (self.__class__, (self._name, self.__file__, self._import_structure))
