@@ -107,6 +107,9 @@ class DDIMPipeline(DiffusionPipeline):
             # 2. predict previous mean of image x_t-1 and add variance depending on eta
             # eta corresponds to η in paper and should be between [0, 1]
             # do x_t -> x_t-1
+
+            # here we want to add guidance of attention map's derivative to xt to maximize attention map
+            
             image = self.scheduler.step(
                 model_output, t, image, eta=eta, use_clipped_model_output=use_clipped_model_output, generator=generator
             ).prev_sample
